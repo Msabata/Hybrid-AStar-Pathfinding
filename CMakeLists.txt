@@ -24,19 +24,18 @@ add_executable(hybrid_astar
     main.cpp
     hybrid_astar.cpp
     multi_queue_astar.cpp
+    common.cpp  # Added common implementation file
     $<TARGET_OBJECTS:hybrid_astar_cuda>
 )
 
 # Link libraries
 target_link_libraries(hybrid_astar hybrid_astar_cuda ${CUDA_LIBRARIES} OpenMP::OpenMP_CXX)
 
-
 # Add CUDA objects as a separate target
 add_library(hybrid_astar_cuda OBJECT 
     gpu_hash_tables.cu
 )
 set_target_properties(hybrid_astar_cuda PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
 
 # Enable OpenMP
 if(MSVC)
@@ -46,13 +45,10 @@ else()
 endif()
 
 # Set CUDA properties
-# CMakeLists.txt
 set_target_properties(hybrid_astar PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
-
-
 
 # Print some info
 message(STATUS "CUDA version: ${CUDA_VERSION}")

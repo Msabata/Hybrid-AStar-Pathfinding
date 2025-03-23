@@ -1,7 +1,6 @@
 #pragma once
 #include <cstddef>
-// common.h
-#include <functional> // Add this line
+#include <functional>
 
 // Grid and Point structures as defined in the problem
 typedef struct {
@@ -10,7 +9,7 @@ typedef struct {
     int* weights;  // Weight of each cell, -1 indicates an impassable wall
 } Grid;
 
-// common.h
+// Point structure representing 2D coordinates
 struct Point {
     int x;
     int y;
@@ -28,9 +27,9 @@ struct PointHash {
 };
 
 // Direction vectors for 8-directional movement
-const int dx[8] = {0, 1, 0, -1, 1, 1, -1, -1};
-const int dy[8] = {-1, 0, 1, 0, -1, 1, 1, -1};
-const int costs[8] = {10, 10, 10, 10, 14, 14, 14, 14};
+extern const int dx[8];
+extern const int dy[8];
+extern const int costs[8];
 
 // Grid generator function declaration
 Grid grid_generator(int width, int height, int seed);

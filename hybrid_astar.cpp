@@ -2,320 +2,617 @@
 #include "gpu_hash_tables.cuh"
 #include <algorithm>
 #include <cmath>
-#include <omp.h> // Added
+#include <omp.h>
 #include <iostream>
+#include <numeric>
+#include <chrono>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-// CUDA kernels for heuristic calculation and node filtering
-// Note: These would typically be in a .cu file, but are included here for simplicity
+// CUDA kernel function declarations
 extern "C" {
-    void computeHeuristicWrapper(int* d_x, int* d_y, int size, int goal_x, int goal_y, float* d_h, int threads_per_block);
-    void filterNodesWrapper(int* d_x, int* d_y, int* d_g, int size, int width, int height, int* d_weights, 
-                           int* d_valid, int* d_closed_x, int* d_closed_y, int* d_closed_g, int closed_size, int threads_per_block);
+    void fusedHeuristicAndValidationWrapper(
+        int* d_x, int* d_y, int* d_g, int size,
+        int goal_x, int goal_y, int width, int height,
+        int* d_weights, float* d_h, int* d_valid, int* d_is_goal,
+        int threads_per_block, cudaStream_t stream = 0);
 }
 
-HybridAStar::HybridAStar(const Grid& g, int queues, int threads) 
-    : grid(g), num_queues(queues), threads_per_block(threads) {}
+// Constructor: Initialize with search space and parallelization configuration
+HybridAStar::HybridAStar(const Grid& g, int queues, int threads)
+    : grid(g), num_queues(queues), threads_per_block(threads) {
+    // GPU resources initialized on-demand
+}
 
-// Helper method to get index in grid array
+// Destructor: Release GPU resources
+HybridAStar::~HybridAStar() {
+    releaseGPUResources();
+}
+
+// Linear index calculation for 2D grid
 int HybridAStar::getIndex(int x, int y) const {
     return y * grid.width + x;
 }
 
-// CPU version of heuristic calculation
+// Diagonal distance heuristic (admissible for 8-directional grid)
 float HybridAStar::calculateHeuristic(int x, int y, const Point& goal) const {
-    // Diagonal distance heuristic
     int dx = abs(x - goal.x);
     int dy = abs(y - goal.y);
-    int min_coord = std::min(dx, dy);
-    int max_coord = std::max(dx, dy);
-    return 10.0f * (dx + dy) + (14.0f - 2 * 10.0f) * min_coord;
+    int diag = std::min(dx, dy);
+    int straight = dx + dy - 2 * diag;
+    // Cost: 14 for diagonal, 10 for cardinal moves
+    return 14.0f * diag + 10.0f * straight;
 }
 
-// Reconstruct path from closed list
-std::vector<Point> HybridAStar::reconstructPath(const std::vector<Node>& nodes, int goal_idx) const {
+// Path reconstruction from closed set nodes
+std::vector<Point> HybridAStar::reconstructPath(const std::vector<CompactNode>& nodes, int goal_idx) const {
     std::vector<Point> path;
     int current = goal_idx;
-    
+
+    // Trace back from goal to start using parent indices
     while (current != -1) {
-        const Node& node = nodes[current];
+        const CompactNode& node = nodes[current];
         Point p = { node.x, node.y };
         path.push_back(p);
         current = node.parent_idx;
     }
-    
+
+    // Reverse to get start-to-goal ordering
     std::reverse(path.begin(), path.end());
     return path;
 }
 
-// Main A* search function
-std::vector<Point> HybridAStar::findPath(const Point& start, const Point& goal) {
-    std::vector<Point> path;
-    
-    // Initialize multiple priority queues for open list
-    std::vector<std::priority_queue<Node, std::vector<Node>, std::greater<Node>>> open_queues(num_queues);
-    
-    // Initialize closed list and nodes list
-    std::vector<Node> all_nodes;
-    std::unordered_map<Point, Node, PointHash> closed_map;
-    
-    // Add start node
-    Node start_node(start.x, start.y, 0, calculateHeuristic(start.x, start.y, goal), -1);
-    all_nodes.push_back(start_node);
-    
-    // Add to first queue
-    open_queues[0].push(start_node);
-    
-    // Target node index (when found)
-    int target_idx = -1;
-    
-    // Main search loop
-    while (true) {
-        bool all_empty = true;
-        std::vector<Node> expanded_nodes;
-        
-        // Extract nodes from each queue in parallel
-        #pragma omp parallel for
-        for (int i = 0; i < num_queues; i++) {
-            if (!open_queues[i].empty()) {
-                #pragma omp critical
-                {
-                    all_empty = false;
-                }
-                
-                Node current = open_queues[i].top();
-                open_queues[i].pop();
-                
-                // Check if already processed
-                Point p = { current.x, current.y };
-                if (closed_map.find(p) != closed_map.end())
-                    continue;
-                
-                // Add to closed list
-                #pragma omp critical
-                {
-                    closed_map[p] = current;
-                }
-                
-                // If target is reached
-                if (current.x == goal.x && current.y == goal.y) {
-                    #pragma omp critical
-                    {
-                        int node_idx = all_nodes.size() - 1;
-                        if (target_idx == -1 || current.f < all_nodes[target_idx].f) {
-                            target_idx = node_idx;
-                        }
-                    }
-                    continue;
-                }
-                
-                // Expand neighbors
-                for (int dir = 0; dir < 8; dir++) {
-                    int nx = current.x + dx[dir];
-                    int ny = current.y + dy[dir];
-                    
-                    // Skip out-of-bounds cells
-                    if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height)
-                        continue;
-                    
-                    // Skip walls
-                    int idx = getIndex(nx, ny);
-                    if (grid.weights[idx] == -1)
-                        continue;
-                    
-                    // Calculate g value
-                    int ng = current.g + costs[dir];
-                    
-                    // Create point for lookup
-                    Point np = { nx, ny };
-                    
-                    // Skip if already in closed list with better g
-                    if (closed_map.find(np) != closed_map.end() && 
-                        closed_map[np].g <= ng)
-                        continue;
-                    
-                    // Calculate heuristic and create node
-                    float h = calculateHeuristic(nx, ny, goal);
-                    Node neighbor(nx, ny, ng, ng + h, all_nodes.size() - 1);
-                    
-                    #pragma omp critical
-                    {
-                        all_nodes.push_back(neighbor);
-                        expanded_nodes.push_back(neighbor);
-                    }
-                }
-            }
-        }
-        
-        // If all queues are empty, break
-        if (all_empty)
-            break;
-        
-        // If goal is found and has best f-value, break
-        if (target_idx != -1) {
-            bool is_optimal = true;
-            
-            for (int i = 0; i < num_queues; i++) {
-                if (!open_queues[i].empty() && 
-                    open_queues[i].top().f < all_nodes[target_idx].f) {
-                    is_optimal = false;
-                    break;
-                }
-            }
-            
-            if (is_optimal) {
-                return reconstructPath(all_nodes, target_idx);
-            }
-        }
-        
-        // Process expanded nodes with GPU
-        if (!expanded_nodes.empty()) {
-            processBatchGPU(expanded_nodes, goal, open_queues, closed_map);
-        }
+// Initialize GPU resources with optimal memory allocation pattern
+void HybridAStar::initializeGPUResources() {
+    if (gpu_initialized) return;
+
+    try {
+        // Create CUDA streams for overlapped execution
+        cudaStreamCreate(&compute_stream);
+        cudaStreamCreate(&transfer_stream);
+
+        // Allocate device memory with initial capacity
+        buffer_capacity = INITIAL_BUFFER_CAPACITY;
+        cudaMalloc(&d_x_buffer, buffer_capacity * sizeof(int));
+        cudaMalloc(&d_y_buffer, buffer_capacity * sizeof(int));
+        cudaMalloc(&d_g_buffer, buffer_capacity * sizeof(int));
+        cudaMalloc(&d_parent_buffer, buffer_capacity * sizeof(int));
+        cudaMalloc(&d_h_buffer, buffer_capacity * sizeof(float));
+        cudaMalloc(&d_valid_buffer, buffer_capacity * sizeof(int));
+        cudaMalloc(&d_is_goal_buffer, buffer_capacity * sizeof(int));
+
+        // Pre-cache grid terrain data for reduced transfers
+        cudaMalloc(&d_grid_weights, grid.width * grid.height * sizeof(int));
+        cudaMemcpyAsync(d_grid_weights, grid.weights,
+            grid.width * grid.height * sizeof(int),
+            cudaMemcpyHostToDevice, transfer_stream);
+        cudaStreamSynchronize(transfer_stream);
+
+        gpu_initialized = true;
     }
-    
-    // If target was found, reconstruct path
-    if (target_idx != -1) {
-        return reconstructPath(all_nodes, target_idx);
+    catch (const std::exception& e) {
+        // Clean up partial allocations on failure
+        releaseGPUResources();
+        throw;  // Re-throw for upstream handling
     }
-    
-    // No path found
-    return path;
 }
 
-// GPU batch processing of expanded nodes
-void HybridAStar::processBatchGPU(const std::vector<Node>& expanded_nodes, 
-                                 const Point& goal, 
-                                 std::vector<std::priority_queue<Node, std::vector<Node>, std::greater<Node>>>& open_queues, const std::unordered_map<Point, Node, PointHash>& closed_map) {
-    int batch_size = expanded_nodes.size();
+// Dynamic buffer resizing with 1.5x growth pattern
+void HybridAStar::ensureBufferCapacity(size_t required_size) {
+    if (required_size <= buffer_capacity) return;
+
+    // Calculate new capacity with room for growth
+    size_t new_capacity = std::max(required_size,
+        static_cast<size_t>(buffer_capacity * 1.5f));
+
+    try {
+        // Allocate new buffers
+        int* new_x_buffer, * new_y_buffer, * new_g_buffer, * new_parent_buffer;
+        float* new_h_buffer;
+        int* new_valid_buffer, * new_is_goal_buffer;
+
+        cudaMalloc(&new_x_buffer, new_capacity * sizeof(int));
+        cudaMalloc(&new_y_buffer, new_capacity * sizeof(int));
+        cudaMalloc(&new_g_buffer, new_capacity * sizeof(int));
+        cudaMalloc(&new_parent_buffer, new_capacity * sizeof(int));
+        cudaMalloc(&new_h_buffer, new_capacity * sizeof(float));
+        cudaMalloc(&new_valid_buffer, new_capacity * sizeof(int));
+        cudaMalloc(&new_is_goal_buffer, new_capacity * sizeof(int));
+
+        // Copy existing data if present
+        if (buffer_capacity > 0) {
+            cudaMemcpyAsync(new_x_buffer, d_x_buffer,
+                buffer_capacity * sizeof(int),
+                cudaMemcpyDeviceToDevice, compute_stream);
+            cudaMemcpyAsync(new_y_buffer, d_y_buffer,
+                buffer_capacity * sizeof(int),
+                cudaMemcpyDeviceToDevice, compute_stream);
+            cudaMemcpyAsync(new_g_buffer, d_g_buffer,
+                buffer_capacity * sizeof(int),
+                cudaMemcpyDeviceToDevice, compute_stream);
+            cudaMemcpyAsync(new_parent_buffer, d_parent_buffer,
+                buffer_capacity * sizeof(int),
+                cudaMemcpyDeviceToDevice, compute_stream);
+            cudaMemcpyAsync(new_h_buffer, d_h_buffer,
+                buffer_capacity * sizeof(float),
+                cudaMemcpyDeviceToDevice, compute_stream);
+            cudaMemcpyAsync(new_valid_buffer, d_valid_buffer,
+                buffer_capacity * sizeof(int),
+                cudaMemcpyDeviceToDevice, compute_stream);
+            cudaMemcpyAsync(new_is_goal_buffer, d_is_goal_buffer,
+                buffer_capacity * sizeof(int),
+                cudaMemcpyDeviceToDevice, compute_stream);
+
+            // Wait for transfers to complete
+            cudaStreamSynchronize(compute_stream);
+
+            // Free old buffers
+            cudaFree(d_x_buffer);
+            cudaFree(d_y_buffer);
+            cudaFree(d_g_buffer);
+            cudaFree(d_parent_buffer);
+            cudaFree(d_h_buffer);
+            cudaFree(d_valid_buffer);
+            cudaFree(d_is_goal_buffer);
+        }
+
+        // Update pointers and capacity
+        d_x_buffer = new_x_buffer;
+        d_y_buffer = new_y_buffer;
+        d_g_buffer = new_g_buffer;
+        d_parent_buffer = new_parent_buffer;
+        d_h_buffer = new_h_buffer;
+        d_valid_buffer = new_valid_buffer;
+        d_is_goal_buffer = new_is_goal_buffer;
+        buffer_capacity = new_capacity;
+
+    }
+    catch (const std::exception& e) {
+        // Maintain existing capacity on error
+        std::cerr << "Buffer resize failed: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// Release all GPU resources
+void HybridAStar::releaseGPUResources() {
+    if (!gpu_initialized) return;
+
+    // Free device memory
+    if (d_x_buffer) cudaFree(d_x_buffer);
+    if (d_y_buffer) cudaFree(d_y_buffer);
+    if (d_g_buffer) cudaFree(d_g_buffer);
+    if (d_parent_buffer) cudaFree(d_parent_buffer);
+    if (d_h_buffer) cudaFree(d_h_buffer);
+    if (d_valid_buffer) cudaFree(d_valid_buffer);
+    if (d_is_goal_buffer) cudaFree(d_is_goal_buffer);
+    if (d_grid_weights) cudaFree(d_grid_weights);
+
+    // Reset pointers
+    d_x_buffer = d_y_buffer = d_g_buffer = d_parent_buffer = nullptr;
+    d_valid_buffer = d_is_goal_buffer = d_grid_weights = nullptr;
+    d_h_buffer = nullptr;
+
+    // Destroy streams
+    cudaStreamDestroy(compute_stream);
+    cudaStreamDestroy(transfer_stream);
+
+    // Reset state
+    gpu_initialized = false;
+    buffer_capacity = 0;
+}
+
+// Core A* search algorithm with GPU acceleration
+std::vector<Point> HybridAStar::findPath(const Point& start, const Point& goal) {
+    nodes_expanded = 0;
+    found_goal = false;
+    best_goal_node_idx = -1;
+    all_nodes_next_idx = 0;
+    std::vector<Point> path;
+
+    // Initialize GPU resources on first use
+    if (!gpu_initialized) {
+        try {
+            initializeGPUResources();
+        }
+        catch (const std::exception& e) {
+            std::cerr << "GPU initialization failed: " << e.what() << std::endl;
+            std::cerr << "Falling back to CPU implementation" << std::endl;
+            return fallbackCPUSearch(start, goal);
+        }
+    }
+
+    // Ensure buffer capacity for grid
+    if (grid.width * grid.height > buffer_capacity) {
+        size_t grid_size = static_cast<size_t>(grid.width) * static_cast<size_t>(grid.height);
+        size_t max_size = static_cast<size_t>(1 << 24);  // 16M entries maximum
+        try {
+            ensureBufferCapacity(std::min(grid_size, max_size));
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Buffer allocation failed: " << e.what() << std::endl;
+            return fallbackCPUSearch(start, goal);
+        }
+    }
+
+    // Initialize data structures
+    std::vector<std::priority_queue<CompactNode, std::vector<CompactNode>,
+        std::greater<CompactNode>>> open_queues(num_queues);
+    std::vector<CompactNode> all_nodes;
+    std::unordered_map<Point, CompactNode, PointHash> closed_map;
+
+    // Add start node
+    CompactNode start_node(start.x, start.y, 0, calculateHeuristic(start.x, start.y, goal), -1);
+    all_nodes.push_back(start_node);
+    all_nodes_next_idx = all_nodes.size();
+
+    // Insert to appropriate queue using spatial hash for distribution
+    int queue_idx = (start.x * 73856093 + start.y * 19349663) % num_queues;
+    if (queue_idx < 0) queue_idx += num_queues;  // Ensure positive index
+    open_queues[queue_idx].push(start_node);
+
+    // Main search loop with iteration limit for safety
+    int iterations = 0;
+    const int max_iterations = grid.width * grid.height;
+
+    while (iterations++ < max_iterations) {
+        // Find queue with minimum f-value globally
+        float min_f = std::numeric_limits<float>::max();
+        int min_queue = -1;
+
+        for (int i = 0; i < num_queues; i++) {
+            if (!open_queues[i].empty() && open_queues[i].top().f < min_f) {
+                min_f = open_queues[i].top().f;
+                min_queue = i;
+            }
+        }
+
+        // Exit if open set exhausted
+        if (min_queue == -1) {
+            break;
+        }
+
+        // Check for goal state from GPU processing
+        if (found_goal && best_goal_node_idx >= 0) {
+            return reconstructPath(all_nodes, best_goal_node_idx);
+        }
+
+        // Extract node with minimum f-value
+        CompactNode current = open_queues[min_queue].top();
+        open_queues[min_queue].pop();
+
+        // Create point for closed list lookup
+        Point p = { current.x, current.y };
+        auto it = closed_map.find(p);
+        if (it != closed_map.end() && it->second.g <= current.g) {
+            continue;  // Skip if better path already found
+        }
+
+        // Add to closed list and tracking structures
+        int current_idx = all_nodes.size();
+        all_nodes.push_back(current);
+        closed_map[p] = current;
+        nodes_expanded++;
+        all_nodes_next_idx = all_nodes.size();  // Update for goal tracking
+
+        // Direct goal check on CPU side
+        if (current.x == goal.x && current.y == goal.y) {
+            return reconstructPath(all_nodes, current_idx);
+        }
+
+        // Generate successor nodes
+        std::vector<CompactNode> neighbors;
+        neighbors.reserve(8);  // Pre-allocate for 8-directional movement
+
+        for (int dir = 0; dir < 8; dir++) {
+            int nx = current.x + dx[dir];
+            int ny = current.y + dy[dir];
+
+            // Skip invalid cells
+            if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height)
+                continue;
+
+            // Skip walls/obstacles
+            int idx = getIndex(nx, ny);
+            if (idx < 0 || idx >= grid.width * grid.height || grid.weights[idx] == -1)
+                continue;
+
+            // Calculate path cost including terrain weight
+            int cell_weight = std::max(1, grid.weights[idx]);
+            int ng = current.g + costs[dir] * cell_weight;
+
+            // Create neighbor point
+            Point np = { nx, ny };
+
+            // Skip if better path exists in closed list
+            auto closed_it = closed_map.find(np);
+            if (closed_it != closed_map.end() && closed_it->second.g <= ng)
+                continue;
+
+            // Create node and add to batch
+            float h = calculateHeuristic(nx, ny, goal);
+            CompactNode neighbor(nx, ny, ng, ng + h, current_idx);
+            neighbors.push_back(neighbor);
+        }
+
+        // Process neighbors batch if non-empty
+        if (!neighbors.empty()) {
+            try {
+                // Choose processing method based on batch characteristics
+                if (shouldProcessOnGPU(neighbors.size())) {
+                    processBatchGPU(neighbors, goal, open_queues, closed_map);
+                }
+                else {
+                    processBatchCPU(neighbors, goal, open_queues, closed_map);
+                }
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Batch processing error: " << e.what() << std::endl;
+                // Fall back to CPU processing on error
+                processBatchCPU(neighbors, goal, open_queues, closed_map);
+            }
+        }
+
+        // Periodic diagnostic output
+        if (nodes_expanded % 10000 == 0) {
+            int total_open = std::accumulate(open_queues.begin(), open_queues.end(), 0,
+                [](int sum, const auto& q) { return sum + static_cast<int>(q.size()); });
+
+            std::cout << "Processed " << nodes_expanded << " nodes, open: "
+                << total_open << ", closed: " << closed_map.size() << std::endl;
+        }
+    }
+
+    // Return best path or empty if none found
+    if (found_goal && best_goal_node_idx >= 0) {
+        return reconstructPath(all_nodes, best_goal_node_idx);
+    }
+
+    return path;  // Empty path if no solution found
+}
+
+// GPU-based batch processing with goal detection
+void HybridAStar::processBatchGPU(
+    const std::vector<CompactNode>& neighbors,
+    const Point& goal,
+    std::vector<std::priority_queue<CompactNode, std::vector<CompactNode>,
+    std::greater<CompactNode>>>& open_queues,
+    const std::unordered_map<Point, CompactNode, PointHash>& closed_map) {
+
+    int batch_size = neighbors.size();
     if (batch_size == 0) return;
-    
-    // Prepare data for GPU
+
+    // Ensure adequate buffer capacity
+    ensureBufferCapacity(batch_size);
+
+    // Convert to Structure-of-Arrays format for GPU
     std::vector<int> h_x(batch_size);
     std::vector<int> h_y(batch_size);
     std::vector<int> h_g(batch_size);
     std::vector<int> h_parent(batch_size);
-    
+
     for (int i = 0; i < batch_size; i++) {
-        h_x[i] = expanded_nodes[i].x;
-        h_y[i] = expanded_nodes[i].y;
-        h_g[i] = expanded_nodes[i].g;
-        h_parent[i] = expanded_nodes[i].parent_idx;
+        h_x[i] = neighbors[i].x;
+        h_y[i] = neighbors[i].y;
+        h_g[i] = neighbors[i].g;
+        h_parent[i] = neighbors[i].parent_idx;
     }
-    
-    // Allocate device memory
-    int *d_x, *d_y, *d_g, *d_parent, *d_valid;
-    float *d_h;
-    
-    cudaMalloc(&d_x, batch_size * sizeof(int));
-    cudaMalloc(&d_y, batch_size * sizeof(int));
-    cudaMalloc(&d_g, batch_size * sizeof(int));
-    cudaMalloc(&d_parent, batch_size * sizeof(int));
-    cudaMalloc(&d_h, batch_size * sizeof(float));
-    cudaMalloc(&d_valid, batch_size * sizeof(int));
-    
-    // Copy data to device
-    cudaMemcpy(d_x, h_x.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, h_y.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_g, h_g.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_parent, h_parent.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice);
-    
-    // Compute heuristics in parallel on GPU
-    computeHeuristicWrapper(d_x, d_y, batch_size, goal.x, goal.y, d_h, threads_per_block);
-    
-    // Copy grid weights to device if needed
-    int *d_weights;
-    cudaMalloc(&d_weights, grid.width * grid.height * sizeof(int));
-    cudaMemcpy(d_weights, grid.weights, grid.width * grid.height * sizeof(int), cudaMemcpyHostToDevice);
-    
-    // Prepare closed list for GPU
-    std::vector<int> closed_x, closed_y, closed_g;
-    for (const auto& pair : closed_map) {
-        closed_x.push_back(pair.first.x);
-        closed_y.push_back(pair.first.y);
-        closed_g.push_back(pair.second.g);
-    }
-    
-    int closed_size = closed_x.size();
-    int *d_closed_x = nullptr, *d_closed_y = nullptr, *d_closed_g = nullptr;
-    
-    if (closed_size > 0) {
-        cudaMalloc(&d_closed_x, closed_size * sizeof(int));
-        cudaMalloc(&d_closed_y, closed_size * sizeof(int));
-        cudaMalloc(&d_closed_g, closed_size * sizeof(int));
-        
-        cudaMemcpy(d_closed_x, closed_x.data(), closed_size * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_closed_y, closed_y.data(), closed_size * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_closed_g, closed_g.data(), closed_size * sizeof(int), cudaMemcpyHostToDevice);
-    }
-    
-    // Filter valid nodes on GPU
-    filterNodesWrapper(d_x, d_y, d_g, batch_size, grid.width, grid.height, d_weights,
-                     d_valid, d_closed_x, d_closed_y, d_closed_g, closed_size, threads_per_block);
-    
-    // Copy results back to host
+
+    // Asynchronous host-to-device transfer 
+    cudaMemcpyAsync(d_x_buffer, h_x.data(), batch_size * sizeof(int),
+        cudaMemcpyHostToDevice, transfer_stream);
+    cudaMemcpyAsync(d_y_buffer, h_y.data(), batch_size * sizeof(int),
+        cudaMemcpyHostToDevice, transfer_stream);
+    cudaMemcpyAsync(d_g_buffer, h_g.data(), batch_size * sizeof(int),
+        cudaMemcpyHostToDevice, transfer_stream);
+    cudaMemcpyAsync(d_parent_buffer, h_parent.data(), batch_size * sizeof(int),
+        cudaMemcpyHostToDevice, transfer_stream);
+
+    // Wait for transfers to complete
+    cudaStreamSynchronize(transfer_stream);
+
+    // Initialize result buffers
+    cudaMemsetAsync(d_valid_buffer, 0, batch_size * sizeof(int), compute_stream);
+    cudaMemsetAsync(d_is_goal_buffer, 0, batch_size * sizeof(int), compute_stream);
+
+    // Execute fused GPU kernel (heuristic + validation + goal detection)
+    fusedHeuristicAndValidationWrapper(
+        d_x_buffer, d_y_buffer, d_g_buffer, batch_size,
+        goal.x, goal.y, grid.width, grid.height,
+        d_grid_weights, d_h_buffer, d_valid_buffer, d_is_goal_buffer,
+        threads_per_block, compute_stream);
+
+    // Asynchronous device-to-host transfer of results
     std::vector<float> h_h(batch_size);
     std::vector<int> h_valid(batch_size);
-    
-    cudaMemcpy(h_h.data(), d_h, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_valid.data(), d_valid, batch_size * sizeof(int), cudaMemcpyDeviceToHost);
-    
-    // Add valid nodes to open queues
-    #pragma omp parallel for
+    std::vector<int> h_is_goal(batch_size);
+
+    cudaMemcpyAsync(h_h.data(), d_h_buffer, batch_size * sizeof(float),
+        cudaMemcpyDeviceToHost, transfer_stream);
+    cudaMemcpyAsync(h_valid.data(), d_valid_buffer, batch_size * sizeof(int),
+        cudaMemcpyDeviceToHost, transfer_stream);
+    cudaMemcpyAsync(h_is_goal.data(), d_is_goal_buffer, batch_size * sizeof(int),
+        cudaMemcpyDeviceToHost, transfer_stream);
+
+    // Wait for results
+    cudaStreamSynchronize(transfer_stream);
+    cudaStreamSynchronize(compute_stream);
+
+    // Check for goal nodes first (higher priority)
+    for (int i = 0; i < batch_size; i++) {
+        if (h_valid[i] && h_is_goal[i]) {
+            // Found goal state in GPU batch
+            CompactNode goal_node(
+                h_x[i], h_y[i], h_g[i],
+                h_g[i] + h_h[i], h_parent[i]
+            );
+
+            // Atomic goal state update
+#pragma omp critical
+            {
+                if (!found_goal || goal_node.f < best_goal_node.f) {
+                    found_goal = true;
+                    best_goal_node = goal_node;
+                    best_goal_node_idx = all_nodes_next_idx + i;
+                }
+            }
+        }
+    }
+
+    // Process remaining valid nodes in parallel
+#pragma omp parallel for
     for (int i = 0; i < batch_size; i++) {
         if (h_valid[i]) {
-            Node node(h_x[i], h_y[i], h_g[i], h_g[i] + h_h[i], h_parent[i]);
-            
-            // Distribute to queues (simplified hash distribution)
-            int queue_idx = (h_x[i] * 31 + h_y[i]) % num_queues;
-            
-            #pragma omp critical
+            // Create node with computed heuristic
+            CompactNode node(
+                h_x[i], h_y[i], h_g[i],
+                h_g[i] + h_h[i], h_parent[i]
+            );
+
+            // Determine queue assignment with consistent spatial hash
+            int queue_idx = (h_x[i] * 73856093 + h_y[i] * 19349663) % num_queues;
+            if (queue_idx < 0) queue_idx += num_queues;  // Ensure positive index
+
+            // Thread-safe insertion
+#pragma omp critical
             {
                 open_queues[queue_idx].push(node);
             }
         }
     }
-    
-    // Free device memory
-    cudaFree(d_x);
-    cudaFree(d_y);
-    cudaFree(d_g);
-    cudaFree(d_parent);
-    cudaFree(d_h);
-    cudaFree(d_valid);
-    cudaFree(d_weights);
-    
-    if (closed_size > 0) {
-        cudaFree(d_closed_x);
-        cudaFree(d_closed_y);
-        cudaFree(d_closed_g);
+}
+
+// CPU-based batch processing (fallback path)
+void HybridAStar::processBatchCPU(
+    const std::vector<CompactNode>& neighbors,
+    const Point& goal,
+    std::vector<std::priority_queue<CompactNode, std::vector<CompactNode>,
+    std::greater<CompactNode>>>& open_queues,
+    const std::unordered_map<Point, CompactNode, PointHash>& closed_map) {
+
+    // Process neighbors in parallel with OpenMP
+#pragma omp parallel for
+    for (int i = 0; i < static_cast<int>(neighbors.size()); i++) {
+        const auto& neighbor = neighbors[i];
+
+        // Skip if already in closed list with better g-value
+        Point p = { neighbor.x, neighbor.y };
+
+        bool skip = false;
+#pragma omp critical
+        {
+            auto it = closed_map.find(p);
+            if (it != closed_map.end() && it->second.g <= neighbor.g) {
+                skip = true;
+            }
+        }
+
+        if (skip) continue;
+
+        // Check for goal state
+        if (neighbor.x == goal.x && neighbor.y == goal.y) {
+#pragma omp critical
+            {
+                if (!found_goal || neighbor.f < best_goal_node.f) {
+                    found_goal = true;
+                    best_goal_node = neighbor;
+                    best_goal_node_idx = all_nodes_next_idx + i;
+                }
+            }
+        }
+
+        // Determine queue index with consistent spatial hash
+        int queue_idx = (neighbor.x * 73856093 + neighbor.y * 19349663) % num_queues;
+        if (queue_idx < 0) queue_idx += num_queues;
+
+        // Add to appropriate queue
+#pragma omp critical
+        {
+            open_queues[queue_idx].push(neighbor);
+        }
     }
 }
 
-// Implementation of grid generator function
-Grid grid_generator(int width, int height, int seed) {
-    Grid grid;
-    grid.width = width;
-    grid.height = height;
-    grid.weights = new int[width * height];
-    
-    // Initialize with random seed
-    srand(seed);
-    
-    // Fill with random weights (1-10), -1 for walls
-    for (int i = 0; i < width * height; i++) {
-        // 20% chance of wall
-        if (rand() % 100 < 20) {
-            grid.weights[i] = -1;  // Wall
-        } else {
-            grid.weights[i] = 1 + (rand() % 10);  // Random weight 1-10
+// CPU-only A* implementation for fallback
+std::vector<Point> HybridAStar::fallbackCPUSearch(const Point& start, const Point& goal) {
+    std::vector<Point> path;
+    std::vector<CompactNode> all_nodes;
+    std::unordered_map<Point, CompactNode, PointHash> closed_map;
+    std::priority_queue<CompactNode, std::vector<CompactNode>, std::greater<CompactNode>> open_queue;
+
+    // Initialize with start node
+    CompactNode start_node(start.x, start.y, 0, calculateHeuristic(start.x, start.y, goal), -1);
+    all_nodes.push_back(start_node);
+    open_queue.push(start_node);
+
+    // Standard A* search loop
+    while (!open_queue.empty()) {
+        CompactNode current = open_queue.top();
+        open_queue.pop();
+
+        Point p = { current.x, current.y };
+        if (closed_map.find(p) != closed_map.end() && closed_map[p].g <= current.g) {
+            continue;  // Skip if better path exists
+        }
+
+        int current_idx = all_nodes.size();
+        all_nodes.push_back(current);
+        closed_map[p] = current;
+        nodes_expanded++;
+
+        // Goal test
+        if (current.x == goal.x && current.y == goal.y) {
+            return reconstructPath(all_nodes, current_idx);
+        }
+
+        // Expand neighbors
+        for (int dir = 0; dir < 8; dir++) {
+            int nx = current.x + dx[dir];
+            int ny = current.y + dy[dir];
+
+            // Skip invalid cells
+            if (nx < 0 || nx >= grid.width || ny < 0 || ny >= grid.height) continue;
+
+            int idx = getIndex(nx, ny);
+            if (grid.weights[idx] == -1) continue;  // Wall/obstacle
+
+            // Calculate path cost
+            int ng = current.g + costs[dir] * std::max(1, grid.weights[idx]);
+            Point np = { nx, ny };
+
+            // Skip if in closed list with better g
+            if (closed_map.find(np) != closed_map.end() && closed_map[np].g <= ng) continue;
+
+            // Create and add node
+            float h = calculateHeuristic(nx, ny, goal);
+            open_queue.push(CompactNode(nx, ny, ng, ng + h, current_idx));
         }
     }
-    
-    // Ensure start and end are not walls (assuming corners)
-    grid.weights[0] = 1;  // Top-left
-    grid.weights[width * height - 1] = 1;  // Bottom-right
-    
-    return grid;
+
+    return path;  // Empty path if no solution
+}
+
+// Determine if batch should use GPU based on size and utilization
+bool HybridAStar::shouldProcessOnGPU(size_t batch_size) const {
+    // Small batches have high overhead on GPU
+    if (batch_size < GPU_MIN_BATCH_THRESHOLD)  // Changed from GPU_MIN_BATCH_SIZE
+        return false;
+
+    // Large batches benefit from GPU parallelism
+    if (batch_size > GPU_PREFERRED_BATCH_SIZE)
+        return true;
+
+    // Medium batches based on current GPU utilization
+    return estimateGPUUtilization() < 0.8f;
+}
+
+// Estimate current GPU utilization (values from 0.0 to 1.0)
+float HybridAStar::estimateGPUUtilization() const {
+    return gpu_utilization_estimate;
+}
+
+// Update GPU utilization estimate with exponential moving average
+void HybridAStar::updateGPUUtilizationEstimate(float new_estimate) {
+    const float alpha = 0.2f;  // EMA coefficient for smoothing
+    gpu_utilization_estimate = alpha * new_estimate + (1.0f - alpha) * gpu_utilization_estimate;
 }
